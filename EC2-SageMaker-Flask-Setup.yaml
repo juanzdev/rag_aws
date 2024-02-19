@@ -1,0 +1,183 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS CloudFormation Template to create IAM role, EC2 instance, setup a SageMaker JumpStartModel endpoint, and Flask web server with a GET prediction endpoint.
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: The name of the S3 bucket where the Flask app is stored
+    Default: "s3bucketname"
+  DocumentationFolderName:
+    Type: String
+    Description: Name of Documentation folder name inside the S3 bucket
+    Default: "sagemaker_documentation/"
+  PineconeAPIKey:
+    Type: String
+    Description: Pinecone API key
+    Default: "pineconekey"
+
+Resources:
+  SageMakerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+                - sagemaker.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - Ref: SageMakerExecutionRole
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH inbound traffic
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: ami-0230bd60aa48260c6
+      InstanceType: t2.large
+      IamInstanceProfile:
+        Ref: InstanceProfile
+      SecurityGroups:
+        - Ref: EC2SecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash 
+          echo "export BUCKET_NAME='${BucketName}'" >> /etc/profile
+          echo "export DOCUMENTATION_FOLDER_NAME='${DocumentationFolderName}'" >> /etc/profile
+          echo "export PINECONE_API_KEY='${PineconeAPIKey}'" >> /etc/profile
+
+          yum update -y
+          python3.9 -m venv /myenv
+          source /myenv/bin/activate
+          sudo chmod -R a+rwx /myenv
+          aws configure set region us-east-1
+          pip install --upgrade pip
+          pip install boto3 sagemaker pinecone-client langchain flask pandas
+
+          # Flask web server setup
+          mkdir /var/www
+          cd /var/www
+          
+          # Create llm sagemaker endpoints
+          # =====  generator endpoint =====
+          cat <<EOT >> create_generator_model_endpoint.py
+          import sagemaker
+          import boto3
+          from sagemaker.jumpstart.model import JumpStartModel
+          
+          role_arn = "arn:aws:iam::${AWS::AccountId}:role/${SageMakerExecutionRole}"
+          generator_endpoint_name = "llama-2-generator"
+          model_id, model_version = "meta-textgeneration-llama-2-7b-f", "2.*"
+
+          sagemaker_client = boto3.client('sagemaker')
+
+          endpoint_configs = sagemaker_client.list_endpoint_configs()['EndpointConfigs']
+          config_names = [cfg['EndpointConfigName'] for cfg in endpoint_configs]
+          endpoints = sagemaker_client.list_endpoints()['Endpoints']
+          endpoint_names = [ep['EndpointName'] for ep in endpoints]
+
+          if generator_endpoint_name in config_names and generator_endpoint_name not in endpoint_names:
+            # Delete config and endpoint and recreate all
+            sagemaker_client.delete_endpoint_config(EndpointConfigName=generator_endpoint_name)
+            model = JumpStartModel(model_id=model_id, model_version=model_version, role=role_arn)
+            model.deploy(initial_instance_count=1, instance_type="ml.g5.2xlarge", endpoint_name=generator_endpoint_name)
+
+          elif generator_endpoint_name not in endpoint_names:
+            model = JumpStartModel(model_id=model_id, model_version=model_version, role=role_arn)
+            model.deploy(initial_instance_count=1, instance_type="ml.g5.2xlarge", endpoint_name=generator_endpoint_name)
+
+          EOT
+          python3.9 create_generator_model_endpoint.py
+
+          # ===== encoder endpoint =====
+          cat <<EOT >> create_embedding_model_endpoint.py
+          import sagemaker
+          import boto3
+          from sagemaker.jumpstart.model import JumpStartModel
+          from sagemaker.huggingface import HuggingFaceModel
+          
+          role_arn = "arn:aws:iam::${AWS::AccountId}:role/${SageMakerExecutionRole}"
+          embedding_endpoint_name = "minilm-embedding"
+          
+          hub_config = {
+            "HF_MODEL_ID": "sentence-transformers/all-MiniLM-L6-v2",
+            "HF_TASK": "feature-extraction"
+          }
+
+          huggingface_model = HuggingFaceModel(
+            env=hub_config,
+            role=role_arn,
+            transformers_version= "4.6",
+            pytorch_version = "1.7",
+            py_version = "py36"
+          )
+
+          sagemaker_client = boto3.client('sagemaker')
+
+          endpoint_configs = sagemaker_client.list_endpoint_configs()['EndpointConfigs']
+          config_names = [cfg['EndpointConfigName'] for cfg in endpoint_configs]
+          endpoints = sagemaker_client.list_endpoints()['Endpoints']
+          endpoint_names = [ep['EndpointName'] for ep in endpoints]
+
+          if embedding_endpoint_name in config_names and embedding_endpoint_name not in endpoint_names:
+            # Delete config and endpoint and recreate all
+            sagemaker_client.delete_endpoint_config(EndpointConfigName=embedding_endpoint_name)
+            encoder = huggingface_model.deploy(
+                    initial_instance_count=1,
+                    instance_type="ml.m5.large",
+                    endpoint_name=embedding_endpoint_name
+                )
+
+          elif embedding_endpoint_name not in endpoint_names:
+            encoder = huggingface_model.deploy(
+                    initial_instance_count=1,
+                    instance_type="ml.m5.large",
+                    endpoint_name=embedding_endpoint_name
+                )
+          EOT
+          python3.9 create_embedding_model_endpoint.py
+
+          # copy flask app from s3
+          aws s3 cp s3://${BucketName}/src/ /var/www/src --recursive
+
+          # Run Flask app in the background
+          cd /var/www/src
+          export BUCKET_NAME='${BucketName}'
+          export DOCUMENTATION_FOLDER_NAME='${DocumentationFolderName}'
+          export PINECONE_API_KEY='${PineconeAPIKey}'
+          export AWS_DEFAULT_REGION=us-east-1
+          nohup python3.9 app.py &
+
+Outputs:
+  InstanceId:
+    Description: The Instance ID of the EC2 instance
+    Value: !Ref EC2Instance
+  InstancePublicIP:
+    Description: Public IP address of the EC2 instance
+    Value: !GetAtt EC2Instance.PublicIp
+  RoleArn:
+    Description: The ARN of the created IAM Role
+    Value: !GetAtt SageMakerExecutionRole.Arn
