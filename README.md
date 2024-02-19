@@ -1,7 +1,7 @@
 # RAG POC
 ![Screenshot](screenshot.png)
 
-# Installation steps (or I can show you in a live demo)
+# Installation steps (or live demo)
 0. Extract sagemaker_documentation.zip contents into your s3 bucket in the folder sagemaker_documentation/
 
 1. copy the src folder contents to your s3 bucket ej: assetsbucket/src (this code will be copied to ec2 instance to quickly setup the flask webapp)
